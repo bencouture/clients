@@ -93,6 +93,7 @@ describe("CollectAutofillContentService", () => {
   });
 
   afterEach(() => {
+    collectAutofillContentService.stopMonitoring();
     jest.clearAllMocks();
     jest.restoreAllMocks();
     jest.clearAllTimers();
@@ -4633,6 +4634,196 @@ describe("CollectAutofillContentService", () => {
         container.appendChild(document.createElement("form"));
         expectGate(buildMutation(emptyNodeList(), container.childNodes), false);
       });
+    });
+  });
+
+  describe("shadow mutation collections", () => {
+    let root: ShadowRoot;
+    let collections: jest.SpyInstance;
+    let shadowDomQuery: DomQueryService;
+
+    beforeEach(async () => {
+      jest.useFakeTimers();
+      document.body.innerHTML = `<input id="light-field"><a title="citation">link</a>${"<p>index entry</p>".repeat(1000)}`;
+      const host = document.createElement("div");
+      document.body.append(host);
+      root = host.attachShadow({ mode: "open" });
+      root.innerHTML = "<style>span { position: fixed }</style>";
+      shadowDomQuery = new DomQueryService();
+      shadowDomQuery["pageContainsShadowDom"] = true;
+      collectAutofillContentService = new CollectAutofillContentService(
+        domElementVisibilityService,
+        shadowDomQuery,
+      );
+      jest.spyOn(collectAutofillContentService as any, "sendExtensionMessage").mockResolvedValue({
+        result: null,
+      });
+      jest.spyOn(domElementVisibilityService, "isElementViewable").mockResolvedValue(true);
+      collectAutofillContentService.startMonitoring();
+      await collectAutofillContentService.getPageDetails();
+      collections = jest.spyOn(
+        collectAutofillContentService as any,
+        "queryAutofillFormAndFieldElements",
+      );
+    });
+
+    afterEach(() => {
+      collectAutofillContentService.stopMonitoring();
+      jest.clearAllTimers();
+      jest.useRealTimers();
+    });
+
+    const drain = async () => {
+      await Promise.resolve(); // deliver MutationObserver records
+      await jest.advanceTimersByTimeAsync(2000);
+    };
+
+    it("refreshes cached visibility without collecting the document for tooltip changes", async () => {
+      const visibility = jest.spyOn(domElementVisibilityService, "isElementViewable");
+      const tooltip = document.createElement("span");
+      tooltip.textContent = "citation";
+      document.querySelector("a")?.removeAttribute("title");
+      root.append(tooltip);
+      await drain();
+      tooltip.style.left = "20px";
+      tooltip.style.top = "30px";
+      await drain();
+      tooltip.remove();
+      await drain();
+
+      expect(collections).not.toHaveBeenCalled();
+      expect(visibility).toHaveBeenCalled();
+      expect(collectAutofillContentService["autofillFieldElements"].size).toBe(1);
+    });
+
+    it("falls back for field insertion, ancestor changes, and removal", async () => {
+      const wrapper = document.createElement("div");
+      const input = document.createElement("input");
+      wrapper.append(input);
+      root.append(wrapper);
+      await drain();
+      expect(collections).toHaveBeenCalled();
+      expect(collectAutofillContentService["autofillFieldElements"].has(input as any)).toBe(true);
+
+      collections.mockClear();
+      wrapper.setAttribute("style", "display: none");
+      await drain();
+      expect(collections).toHaveBeenCalled();
+
+      collections.mockClear();
+      wrapper.remove();
+      await drain();
+      expect(collections).toHaveBeenCalled();
+      expect(collectAutofillContentService["autofillFieldElements"].has(input as any)).toBe(false);
+    });
+
+    it("falls back when a slot or stylesheet is added", async () => {
+      root.append(document.createElement("slot"));
+      await drain();
+      expect(collections).toHaveBeenCalledTimes(1);
+      root.querySelector("slot")?.remove();
+      await drain();
+      expect(collections).toHaveBeenCalledTimes(2);
+      root.append(document.createElement("style"));
+      await drain();
+      expect(collections).toHaveBeenCalledTimes(3);
+    });
+
+    it("uses the broad fallback when targeting rules are active", async () => {
+      collectAutofillContentService["pageTargetingRules"] = [];
+      const refresh = jest.spyOn(
+        collectAutofillContentService as any,
+        "debouncedRequirePageDetailsUpdate",
+      );
+      root.append(document.createElement("span"));
+      await drain();
+      expect(refresh).toHaveBeenCalled();
+    });
+
+    it("cancels a pending visibility refresh when monitoring stops", async () => {
+      const visibility = jest.spyOn(domElementVisibilityService, "isElementViewable");
+      visibility.mockClear();
+      root.append(document.createElement("span"));
+      await Promise.resolve();
+      collectAutofillContentService.stopMonitoring();
+      await jest.advanceTimersByTimeAsync(2000);
+      expect(visibility).not.toHaveBeenCalled();
+    });
+
+    it("discovers a nested root attached after its custom host was inserted", async () => {
+      customElements.define("autofill-late-host", class extends HTMLElement {});
+      const host = document.createElement("autofill-late-host");
+      root.append(host);
+      await drain();
+      const nested = host.attachShadow({ mode: "open" });
+      const input = document.createElement("input");
+      nested.append(input);
+      await Promise.resolve();
+      await jest.advanceTimersByTimeAsync(10000);
+
+      expect(collections).toHaveBeenCalled();
+      expect(collectAutofillContentService["autofillFieldElements"].has(input as any)).toBe(true);
+    });
+
+    it("refreshes when a cached field moves between roots", async () => {
+      const input = document.createElement("input");
+      root.append(input);
+      await drain();
+      const otherHost = document.createElement("div");
+      document.body.append(otherHost);
+      const otherRoot = otherHost.attachShadow({ mode: "open" });
+      otherRoot.append(input);
+      await drain();
+
+      expect(collections).toHaveBeenCalled();
+      expect(collectAutofillContentService["autofillFieldElements"].has(input as any)).toBe(true);
+    });
+
+    it("rebuilds a cached field when its shadow-root label changes", async () => {
+      const label = document.createElement("label");
+      const input = document.createElement("input");
+      label.append("Old label", input);
+      root.append(label);
+      await drain();
+      label.replaceChild(document.createTextNode("New label"), label.firstChild!);
+      await drain();
+
+      expect(
+        collectAutofillContentService["autofillFieldElements"].get(input as any)?.["label-tag"],
+      ).toBe("New label");
+    });
+
+    it("discovers a shadow input when its type becomes fillable", async () => {
+      const input = document.createElement("input");
+      input.type = "hidden";
+      root.append(input);
+      await drain();
+      expect(collectAutofillContentService["autofillFieldElements"].has(input as any)).toBe(false);
+      input.type = "text";
+      await drain();
+      expect(collectAutofillContentService["autofillFieldElements"].has(input as any)).toBe(true);
+    });
+
+    it("discovers a new shadow field in an explicit collection before the debounce fires", async () => {
+      document.querySelector("#light-field")?.remove();
+      await drain();
+      expect(collectAutofillContentService["noFieldsFound"]).toBe(true);
+      // jsdom's delayed load event can reset the shadow-DOM detection latch.
+      shadowDomQuery["pageContainsShadowDom"] = true;
+      jest
+        .spyOn(collectAutofillContentService as any, "debouncedRequirePageDetailsUpdate")
+        .mockImplementation(() => {});
+
+      const input = document.createElement("input");
+      root.append(input);
+      const mutations = collectAutofillContentService["mutationObserver"].takeRecords();
+      expect(mutations).not.toHaveLength(0);
+      collectAutofillContentService["handleMutationObserverMutation"](mutations);
+      expect(collectAutofillContentService["domRecentlyMutated"]).toBe(true);
+      const pageDetails = await collectAutofillContentService.getPageDetails();
+
+      expect(pageDetails.fields).toHaveLength(1);
+      expect(collectAutofillContentService["autofillFieldElements"].has(input as any)).toBe(true);
     });
   });
 

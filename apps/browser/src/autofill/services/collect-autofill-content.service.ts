@@ -97,6 +97,7 @@ export class CollectAutofillContentService implements CollectAutofillContentServ
   private lastDetachedPurgeAt = -Infinity;
   private readonly detachedPurgeThrottleMs = 1000;
   private updateAfterMutationIdleCallback: number | NodeJS.Timeout | null = null;
+  private shadowVisibilityIdleCallback: number | NodeJS.Timeout | null = null;
   private pendingOverlaySetup: Map<Element, NodeJS.Timeout | number> = new Map();
   private readonly overlaySetupDelayMs = 100;
   // Constructed in the constructor body, not here: it closes over a field declared further down.
@@ -242,6 +243,10 @@ export class CollectAutofillContentService implements CollectAutofillContentServ
     if (this.updateAfterMutationIdleCallback !== null) {
       cancelIdleCallbackPolyfill(this.updateAfterMutationIdleCallback);
       this.updateAfterMutationIdleCallback = null;
+    }
+    if (this.shadowVisibilityIdleCallback !== null) {
+      cancelIdleCallbackPolyfill(this.shadowVisibilityIdleCallback);
+      this.shadowVisibilityIdleCallback = null;
     }
     this.pendingOverlaySetup.forEach((timeout) => globalThis.clearTimeout(timeout));
     this.pendingOverlaySetup.clear();
@@ -1680,7 +1685,19 @@ export class CollectAutofillContentService implements CollectAutofillContentServ
     const hasMutationsInShadowRoot = this.domQueryService.checkMutationsInShadowRoots(mutations);
 
     if (hasMutationsInShadowRoot) {
-      this.debouncedRequirePageDetailsUpdate();
+      if (this.shadowMutationsNeedPageDetailsUpdate(mutations)) {
+        // A full walk otherwise reuses cached labels and form associations even after their
+        // surrounding shadow DOM changed. Targeted rules have their own cache lifecycle.
+        if (this.pageTargetingRules === null) {
+          this.clearFieldCache();
+          // Explicit collections can run before the debounced refresh.
+          this.requirePageDetailsUpdate();
+        }
+        this.debouncedRequirePageDetailsUpdate();
+      } else {
+        // A fieldless root can still cover or uncover a field elsewhere on the page.
+        this.debouncedRefreshCachedVisibility();
+      }
     }
 
     // New-shadow-root detection only runs when a batch actually added nodes;
@@ -1878,6 +1895,77 @@ export class CollectAutofillContentService implements CollectAutofillContentServ
     this.requirePageDetailsUpdate();
     this.updateAutofillElementsAfterMutation();
   }, this.shadowDomCheckDebounceMs);
+
+  private debouncedRefreshCachedVisibility = debounce(() => {
+    if (!this.isMonitoring) {
+      return;
+    }
+    if (this.shadowVisibilityIdleCallback !== null) {
+      cancelIdleCallbackPolyfill(this.shadowVisibilityIdleCallback);
+    }
+    this.shadowVisibilityIdleCallback = requestIdleCallbackPolyfill(
+      () => {
+        this.shadowVisibilityIdleCallback = null;
+        if (!this.domRecentlyMutated) {
+          void this.updateCachedAutofillFieldVisibility();
+        }
+      },
+      { timeout: 500 },
+    );
+  }, this.shadowDomCheckDebounceMs);
+
+  /** Partial scans never replace the hydration tracker's complete-scan state. */
+  private shadowMutationsNeedPageDetailsUpdate(mutations: MutationRecord[]): boolean {
+    if (this.pageTargetingRules !== null || this.domRecentlyMutated) {
+      return true;
+    }
+
+    const roots = new Set<ShadowRoot>();
+    for (const mutation of mutations) {
+      if (!this.domQueryService.checkMutationsInShadowRoots([mutation])) {
+        continue;
+      }
+      const root = mutation.target.getRootNode();
+      if (!(root instanceof ShadowRoot) || root.host.hasChildNodes()) {
+        return true;
+      }
+      roots.add(root);
+      // Stylesheets can alter the host as well as the contents of the root.
+      if (nodeIsElement(mutation.target) && mutation.target.closest("style, link")) {
+        return true;
+      }
+      for (const node of [...mutation.addedNodes, ...mutation.removedNodes]) {
+        if (nodeIsElement(node) && this.shadowSubtreeNeedsPageDetailsUpdate(node, true)) {
+          return true;
+        }
+      }
+    }
+
+    for (const root of roots) {
+      if (this.shadowSubtreeNeedsPageDetailsUpdate(root, false)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private shadowSubtreeNeedsPageDetailsUpdate(
+    root: Element | ShadowRoot,
+    includeStyles: boolean,
+  ): boolean {
+    // The collection walker intentionally skips style elements and their descendants.
+    if (
+      includeStyles &&
+      ((nodeIsElement(root) && root.matches("style, link")) || root.querySelector("style, link"))
+    ) {
+      return true;
+    }
+    const { elements } = this.domQueryService.queryWithUnresolvedShadowHosts<Element>(
+      root,
+      (element) => element.matches("input, textarea, select, form, slot, span[data-bwautofill]"),
+    );
+    return elements.length > 0;
+  }
 
   private mutationAddsOrRemovesFormField(mutation: MutationRecord): boolean {
     return (
