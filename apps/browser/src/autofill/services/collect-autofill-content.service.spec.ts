@@ -4680,6 +4680,7 @@ describe("CollectAutofillContentService", () => {
 
     it("refreshes cached visibility without collecting the document for tooltip changes", async () => {
       const visibility = jest.spyOn(domElementVisibilityService, "isElementViewable");
+      visibility.mockClear();
       const tooltip = document.createElement("span");
       tooltip.textContent = "citation";
       document.querySelector("a")?.removeAttribute("title");
@@ -4692,8 +4693,99 @@ describe("CollectAutofillContentService", () => {
       await drain();
 
       expect(collections).not.toHaveBeenCalled();
-      expect(visibility).toHaveBeenCalled();
+      expect(visibility).toHaveBeenCalledWith(document.querySelector("#light-field"));
       expect(collectAutofillContentService["autofillFieldElements"].size).toBe(1);
+    });
+
+    it("does not set up an overlay from a visibility check that finishes after restart", async () => {
+      const input = document.querySelector("#light-field") as any;
+      collectAutofillContentService["autofillFieldElements"].get(input)!.viewable = false;
+      let finishVisibility!: (viewable: boolean) => void;
+      jest.spyOn(domElementVisibilityService, "isElementViewable").mockReturnValue(
+        new Promise((resolve) => {
+          finishVisibility = resolve;
+        }),
+      );
+      const setup = jest.spyOn(collectAutofillContentService as any, "setupOverlayOnField");
+      const refresh = collectAutofillContentService["updateCachedAutofillFieldVisibility"]();
+      collectAutofillContentService.stopMonitoring();
+      collectAutofillContentService.startMonitoring();
+      finishVisibility(true);
+      await refresh;
+
+      expect(setup).not.toHaveBeenCalled();
+    });
+
+    it("refreshes a revealed field and requests its overlay", async () => {
+      const input = document.querySelector("#light-field") as any;
+      const field = collectAutofillContentService["autofillFieldElements"].get(input)!;
+      field.viewable = false;
+      const setup = jest.spyOn(collectAutofillContentService as any, "setupOverlayOnField");
+      root.append(document.createElement("span"));
+      await drain();
+
+      expect(field.viewable).toBe(true);
+      expect(setup).toHaveBeenCalledWith(input, field);
+    });
+
+    it("discards a real debounced visibility refresh from a previous monitoring session", async () => {
+      const realDebounce = jest.requireActual<typeof autofillUtils>("../utils").debounce;
+      collectAutofillContentService["debouncedRefreshCachedVisibility"] = realDebounce(
+        collectAutofillContentService["debouncedRefreshCachedVisibility"],
+        collectAutofillContentService["shadowDomCheckDebounceMs"],
+      );
+      const visibility = jest.spyOn(domElementVisibilityService, "isElementViewable");
+      visibility.mockClear();
+      root.append(document.createElement("span"));
+      await Promise.resolve();
+      collectAutofillContentService.stopMonitoring();
+      collectAutofillContentService.startMonitoring();
+      await collectAutofillContentService.getPageDetails();
+      visibility.mockClear();
+      await jest.advanceTimersByTimeAsync(2000);
+
+      expect(visibility).not.toHaveBeenCalled();
+    });
+
+    it("observes shadow fields again after stop, restart, and collection", async () => {
+      collectAutofillContentService.stopMonitoring();
+      collectAutofillContentService.startMonitoring();
+      await collectAutofillContentService.getPageDetails();
+      const input = document.createElement("input");
+      input.name = "after-restart";
+      root.append(input);
+      await drain();
+
+      expect((await collectAutofillContentService.getPageDetails()).fields).toEqual(
+        expect.arrayContaining([expect.objectContaining({ htmlName: "after-restart" })]),
+      );
+    });
+
+    it("rebuilds after a fieldless refresh is followed by mixed light and shadow mutations", async () => {
+      const realDebounce = jest.requireActual<typeof autofillUtils>("../utils").debounce;
+      const delay = collectAutofillContentService["shadowDomCheckDebounceMs"];
+      collectAutofillContentService["debouncedRefreshCachedVisibility"] = realDebounce(
+        collectAutofillContentService["debouncedRefreshCachedVisibility"],
+        delay,
+      );
+      collectAutofillContentService["debouncedRequirePageDetailsUpdate"] = realDebounce(
+        collectAutofillContentService["debouncedRequirePageDetailsUpdate"],
+        delay,
+      );
+      root.append(document.createElement("span"));
+      await Promise.resolve();
+      await jest.advanceTimersByTimeAsync(delay / 2);
+      const input = document.createElement("input");
+      input.name = "shadow-user";
+      root.append(input);
+      document.querySelector("#light-field")?.setAttribute("name", "light-user");
+      await drain();
+
+      const details = await collectAutofillContentService.getPageDetails();
+      expect(details.fields.map((field) => field.htmlName)).toEqual(
+        expect.arrayContaining(["light-user", "shadow-user"]),
+      );
+      expect(collections).toHaveBeenCalled();
     });
 
     it("falls back for field insertion, ancestor changes, and removal", async () => {

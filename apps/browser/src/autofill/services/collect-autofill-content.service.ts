@@ -98,6 +98,7 @@ export class CollectAutofillContentService implements CollectAutofillContentServ
   private readonly detachedPurgeThrottleMs = 1000;
   private updateAfterMutationIdleCallback: number | NodeJS.Timeout | null = null;
   private shadowVisibilityIdleCallback: number | NodeJS.Timeout | null = null;
+  private shadowVisibilityGeneration = 0;
   private pendingOverlaySetup: Map<Element, NodeJS.Timeout | number> = new Map();
   private readonly overlaySetupDelayMs = 100;
   // Constructed in the constructor body, not here: it closes over a field declared further down.
@@ -240,6 +241,7 @@ export class CollectAutofillContentService implements CollectAutofillContentServ
    */
   stopMonitoring(): void {
     this.isMonitoring = false;
+    this.shadowVisibilityGeneration++;
     if (this.updateAfterMutationIdleCallback !== null) {
       cancelIdleCallbackPolyfill(this.updateAfterMutationIdleCallback);
       this.updateAfterMutationIdleCallback = null;
@@ -800,7 +802,11 @@ export class CollectAutofillContentService implements CollectAutofillContentServ
     await Promise.all(
       Array.from(this.autofillFieldElements, async ([element, autofillField]) => {
         const previouslyViewable = autofillField.viewable;
-        autofillField.viewable = await this.domElementVisibilityService.isElementViewable(element);
+        const viewable = await this.domElementVisibilityService.isElementViewable(element);
+        if (this.autofillFieldElements.get(element) !== autofillField) {
+          return;
+        }
+        autofillField.viewable = viewable;
 
         if (!previouslyViewable && autofillField.viewable) {
           this.setupOverlayOnField(element, autofillField);
@@ -1696,7 +1702,7 @@ export class CollectAutofillContentService implements CollectAutofillContentServ
         this.debouncedRequirePageDetailsUpdate();
       } else {
         // A fieldless root can still cover or uncover a field elsewhere on the page.
-        this.debouncedRefreshCachedVisibility();
+        this.debouncedRefreshCachedVisibility(this.shadowVisibilityGeneration);
       }
     }
 
@@ -1764,6 +1770,7 @@ export class CollectAutofillContentService implements CollectAutofillContentServ
    * @private
    */
   private handleWindowLocationMutation() {
+    this.shadowVisibilityGeneration++;
     this.currentLocationHref = globalThis.location.href;
 
     this.domRecentlyMutated = true;
@@ -1896,8 +1903,8 @@ export class CollectAutofillContentService implements CollectAutofillContentServ
     this.updateAutofillElementsAfterMutation();
   }, this.shadowDomCheckDebounceMs);
 
-  private debouncedRefreshCachedVisibility = debounce(() => {
-    if (!this.isMonitoring) {
+  private debouncedRefreshCachedVisibility = debounce((generation: unknown) => {
+    if (!this.isMonitoring || generation !== this.shadowVisibilityGeneration) {
       return;
     }
     if (this.shadowVisibilityIdleCallback !== null) {
@@ -1906,7 +1913,7 @@ export class CollectAutofillContentService implements CollectAutofillContentServ
     this.shadowVisibilityIdleCallback = requestIdleCallbackPolyfill(
       () => {
         this.shadowVisibilityIdleCallback = null;
-        if (!this.domRecentlyMutated) {
+        if (generation === this.shadowVisibilityGeneration && !this.domRecentlyMutated) {
           void this.updateCachedAutofillFieldVisibility();
         }
       },
